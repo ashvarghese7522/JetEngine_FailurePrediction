@@ -1,0 +1,6 @@
+models/
+*.pyc
+__pycache__/
+*.pkl
+*.h5
+*.log

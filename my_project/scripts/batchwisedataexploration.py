@@ -1,193 +1,133 @@
 import torch
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
-from matplotlib.widgets import Button
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 
 
 class EngineFailureDataset(Dataset):
-    def __init__(self, file_path):
-        """
-        Load and preprocess the dataset.
-        """
-        self.data = self.load_data(file_path)
+    def __init__(self, train_file, test_file, rul_file=None, train=True, scaler=None, save_path=None):
+        self.train = train
+        self.data = self.load_data(train_file if train else test_file)
+
+        # Remove constant columns
         self.constant_columns = self.identify_constant_columns()
-        self.data = compute_rul(self.data)
-        self.data = normalize_data(self.data)
+        self.data.drop(columns=self.constant_columns, inplace=True)
+
+        # Handle missing values
+        self.data.fillna(self.data.median(), inplace=True)
+
+        # Remove highly correlated features
+        self.data = self.remove_highly_correlated_features()
+
+        # Compute or merge RUL
+        if train:
+            self.data = self.compute_rul()
+        else:
+            self.data = self.merge_test_rul(rul_file)
+
+        # Normalize data (pass scaler to avoid leakage)
+        self.scaler = scaler if scaler else MinMaxScaler()
+        self.data = self.normalize_data()
+
+        # Save cleaned data if save_path is provided
+        if save_path:
+            self.save_cleaned_data(save_path)
+
+        # Debugging output
+        self.debug_dataset()
 
     def load_data(self, file_path):
-        """
-        Read CSV file and assign appropriate column names.
-        """
-        data = pd.read_csv(file_path, sep='\s+', header=None)
+        """Load dataset and assign column names"""
+        data = pd.read_csv(file_path, delim_whitespace=True, header=None)
         data.columns = ["unit_number", "time_in_cycles", "op_setting_1", "op_setting_2", "op_setting_3"] + \
                        [f"sensor_{i}" for i in range(1, 22)]
-        return data.astype(float)  # Convert all values to float
+        return data.astype(float)
 
     def identify_constant_columns(self):
-        """
-        Identify columns with constant values.
-        """
+        """Identify and return constant columns"""
         return [col for col in self.data.columns if self.data[col].nunique() == 1]
+
+    def remove_highly_correlated_features(self, threshold=0.9):
+        """Remove highly correlated features"""
+        corr_matrix = self.data.iloc[:, 5:].corr(method='spearman').abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+        return self.data.drop(columns=to_drop, axis=1)
+
+    def compute_rul(self):
+        """Compute Remaining Useful Life (RUL)"""
+        max_cycles = self.data.groupby("unit_number")["time_in_cycles"].max()
+        self.data["RUL"] = self.data["unit_number"].map(max_cycles) - self.data["time_in_cycles"]
+        return self.data
+
+    def merge_test_rul(self, rul_file):
+        """Merge actual RUL values into the test dataset"""
+        rul = pd.read_csv(rul_file, delim_whitespace=True, header=None, names=["RUL"])
+        last_cycles = self.data.groupby("unit_number")["time_in_cycles"].max().reset_index()
+        last_cycles.sort_values("unit_number", inplace=True)
+        rul = rul.reset_index(drop=True)
+
+        if len(last_cycles) != len(rul):
+            raise ValueError(f"Mismatch: {len(last_cycles)} last cycles vs {len(rul)} RUL values")
+
+        last_cycles["RUL"] = rul["RUL"].values
+        self.data = self.data.merge(last_cycles[["unit_number", "RUL"]], on="unit_number", how="left")
+        return self.data
+
+    def normalize_data(self):
+        """Normalize sensor and operational data"""
+        cols_to_normalize = [col for col in self.data.columns if col not in ["unit_number", "time_in_cycles", "RUL"]]
+        if self.train:
+            self.scaler.fit(self.data[cols_to_normalize])
+        self.data[cols_to_normalize] = self.scaler.transform(self.data[cols_to_normalize])
+        return self.data
+
+    def save_cleaned_data(self, save_path):
+        """Save cleaned dataset to specified path"""
+        file_name = "train_cleaned.csv" if self.train else "test_cleaned.csv"
+        full_path = f"{save_path}/{file_name}"
+        self.data.to_csv(full_path, index=False)
+        print(f"Cleaned data saved to {full_path}")
+
+    def debug_dataset(self):
+        """Print dataset details for debugging"""
+        print("Dataset Shape:", self.data.shape)
+        print("\nDataset Head:\n", self.data.head())
+        print("\nMissing Values:\n", self.data.isnull().sum().sum())
+        print("\nConstant Columns Removed:", self.constant_columns)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.data.iloc[idx].values, dtype=torch.float32)
-
-
-def compute_rul(data):
-    """
-    Compute Remaining Useful Life (RUL) for each engine.
-    """
-    max_cycles = data.groupby("unit_number")["time_in_cycles"].max()
-    data["RUL"] = data["unit_number"].map(max_cycles) - data["time_in_cycles"]
-    return data
-
-
-def normalize_data(data):
-    """
-    Normalize sensor data using MinMaxScaler.
-    """
-    scaler = MinMaxScaler()
-    cols_to_normalize = data.columns[2:]  # Exclude 'unit_number' and 'time_in_cycles'
-    data[cols_to_normalize] = scaler.fit_transform(data[cols_to_normalize])
-    return data
-
-
-def load_dataloader(file_path, batch_size=64, shuffle=True):
-    """
-    Initialize dataset and DataLoader.
-    """
-    dataset = EngineFailureDataset(file_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-    return dataset, dataloader
-
-
-def explore_batch(dataloader, dataset):
-    """
-    Fetch a single batch and display key statistics.
-    """
-    for batch in dataloader:
-        batch_df = pd.DataFrame(batch.numpy(), columns=dataset.data.columns)
-        print("Head:\n", batch_df.head())
-        print("Tail:\n", batch_df.tail())
-        print("Dtype:\n", batch_df.dtypes)
-        print("Description:\n", batch_df.describe())
-        print("Batch Shape:", batch.shape)
-        print("Batch Mean:\n", batch_df.mean())
-        print("Batch Std Dev:\n", batch_df.std())
-        print("Column Names:", dataset.data.columns.tolist())
-        print("Constant Columns:", dataset.constant_columns)
-        print("Number of Duplicate Rows:", dataset.data.duplicated().sum())
-        print("Missing Values:\n", dataset.data.isnull().sum())
-        dataset.data.fillna(method="ffill", inplace=True)  # Forward fill missing values
-
-        failed_engines = dataset.data.groupby("unit_number")["time_in_cycles"].max()
-        dataset.data["is_last_50_cycles"] = dataset.data.apply(
-            lambda x: 1 if x["time_in_cycles"] > (failed_engines[x["unit_number"]] - 50) else 0, axis=1
-        )
-        sns.boxplot(x="is_last_50_cycles", y="sensor_2", data=dataset.data)
-        plt.title("Sensor 2 Behavior Before Failure")
-        plt.show()
-
-        break  # Process only one batch
-
-
-def plot_sensor_trends(dataset):
-    """
-    Interactive sensor trend visualization for engines.
-    """
-    engine_ids = dataset.data["unit_number"].unique()
-    index = [0]  # Mutable index for button interaction
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plt.subplots_adjust(bottom=0.3)
-
-    ax_next = plt.axes([0.8, 0.05, 0.1, 0.075])
-    ax_prev = plt.axes([0.65, 0.05, 0.1, 0.075])
-    button_next = Button(ax_next, 'Next')
-    button_prev = Button(ax_prev, 'Previous')
-
-    def plot_current_engine():
-        ax.clear()
-        engine_id = engine_ids[index[0]]
-        engine_data = dataset.data[dataset.data["unit_number"] == engine_id]
-
-        for i in range(1, 5):  # Plot first 4 sensors
-            ax.plot(engine_data["time_in_cycles"], engine_data[f"sensor_{i}"], label=f"Sensor {i}")
-
-        ax.set_xlabel("Time in Cycles")
-        ax.set_ylabel("Sensor Readings")
-        ax.legend()
-        ax.set_title(f"Sensor Trends for Engine {engine_id}")
-        plt.draw()
-
-    def next_engine(event):
-        if index[0] < len(engine_ids) - 1:
-            index[0] += 1
-            plot_current_engine()
-
-    def prev_engine(event):
-        if index[0] > 0:
-            index[0] -= 1
-            plot_current_engine()
-
-    button_next.on_clicked(next_engine)
-    button_prev.on_clicked(prev_engine)
-
-    plot_current_engine()
-    plt.show(block=True)
-
-
-def visualize_data(dataset):
-    """
-    Interactive sensor data distribution visualization.
-    """
-    columns = dataset.data.columns[5:]  # Exclude non-sensor columns
-    index = [0]
-
-    fig, ax = plt.subplots()
-    plt.subplots_adjust(bottom=0.3)
-
-    ax_next = plt.axes([0.8, 0.05, 0.1, 0.075])
-    ax_prev = plt.axes([0.65, 0.05, 0.1, 0.075])
-    button_next = Button(ax_next, 'Next')
-    button_prev = Button(ax_prev, 'Previous')
-
-    def plot_sensor():
-        ax.clear()
-        sns.histplot(dataset.data[columns[index[0]]], bins=50, kde=True, ax=ax)
-        ax.set_title(f"Distribution of {columns[index[0]]}")
-        plt.draw()
-
-    def next_sensor(event):
-        if index[0] < len(columns) - 1:
-            index[0] += 1
-            plot_sensor()
-
-    def prev_sensor(event):
-        if index[0] > 0:
-            index[0] -= 1
-            plot_sensor()
-
-    button_next.on_clicked(next_sensor)
-    button_prev.on_clicked(prev_sensor)
-
-    plot_sensor()
-    plt.show(block=True)
+        """Return features (X) and target (y) as tensors"""
+        row = self.data.iloc[idx]
+        features = row.drop(["unit_number", "time_in_cycles", "RUL"]).values
+        label = row["RUL"]
+        return torch.tensor(features, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
 
 if __name__ == "__main__":
-    file_path = "D:/ProjectML/Engine_Failure/my_project/data/raw/train_FD001.txt"
-    dataset, dataloader = load_dataloader(file_path)
+    train_file = "D:/ProjectML/Engine_Failure/my_project/data/raw/train_FD001.txt"
+    test_file = "D:/ProjectML/Engine_Failure/my_project/data/raw/test_FD001.txt"
+    rul_file = "D:/ProjectML/Engine_Failure/my_project/data/raw/RUL_FD001.txt"
+    save_path = "D:/ProjectML/Engine_Failure/my_project/data/processed"
 
-    # Run Exploratory Analysis
-    explore_batch(dataloader, dataset)
+    print("Loading Train Dataset...")
+    train_scaler = MinMaxScaler()
+    train_dataset = EngineFailureDataset(train_file, test_file, train=True, scaler=train_scaler, save_path=save_path)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, drop_last=True)
 
-    # Interactive Visualizations
-    plot_sensor_trends(dataset)
-    visualize_data(dataset)
+    print("Loading Test Dataset...")
+    test_dataset = EngineFailureDataset(train_file, test_file, rul_file, train=False, scaler=train_scaler,
+                                        save_path=save_path)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, drop_last=True)
+
+    print("\nTrain Data Sample (RUL Check):")
+    print(train_dataset.data[["unit_number", "time_in_cycles", "RUL"]].head(10))
+
+    print("\nTest Data Sample (RUL Check):")
+    print(test_dataset.data[["unit_number", "time_in_cycles", "RUL"]].tail(10))
